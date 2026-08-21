@@ -7,6 +7,17 @@ import logging
 import re
 from typing import Any
 
+import warnings as _warnings
+
+# python-osc <= 1.8.3 contains an invalid escape sequence (\w) in dispatcher.py
+# which emits SyntaxWarning on Python 3.12+. Suppress it before import.
+_warnings.filterwarnings(
+    "ignore",
+    category=SyntaxWarning,
+    module=r"pythonosc\.dispatcher",
+)
+del _warnings
+
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import AsyncIOOSCUDPServer
 
@@ -211,6 +222,7 @@ class OSCServer:
         self._hass = hass
         self._entry = entry
         self._transport: asyncio.BaseTransport | None = None
+        self._monitor_callback: Any | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -254,6 +266,14 @@ class OSCServer:
             self._transport = None
             _LOGGER.info("OSC server stopped")
 
+    def set_monitor_callback(self, callback: Any) -> None:
+        """Register a callback invoked for every incoming message (used by the sensor)."""
+        self._monitor_callback = callback
+
+    def clear_monitor_callback(self) -> None:
+        """Remove the monitor callback."""
+        self._monitor_callback = None
+
     # ------------------------------------------------------------------
     # Message handling
     # ------------------------------------------------------------------
@@ -266,32 +286,41 @@ class OSCServer:
             _LOGGER.exception("Unexpected error handling OSC message %s %s", address, args)
 
     def _dispatch(self, address: str, args: list[Any]) -> None:
-        """Parse address, apply filters, and schedule the HA service call."""
+        """Parse address, apply filters, fire events, and schedule service calls."""
         _LOGGER.debug("OSC received: %s %s", address, args)
 
-        # Address must be /<domain>/<entity_name>
         parts = [p for p in address.split("/") if p]
         if len(parts) < 2:
-            _LOGGER.debug("Ignoring malformed OSC address (need at least 2 segments): %s", address)
+            _LOGGER.debug("Malformed OSC address (need /<domain>/<entity_name>): %s", address)
+            self._notify(address, args, None, False, None)
             return
 
         domain = parts[0].lower()
         entity_name = parts[1].lower()
         entity_id = f"{domain}.{entity_name}"
+        canonical = f"/{domain}/{entity_name}"
 
         if not _ENTITY_ID_RE.match(entity_id):
-            _LOGGER.debug("Ignoring address that maps to invalid entity ID %r", entity_id)
+            _LOGGER.debug("Address maps to invalid entity ID %r; ignored", entity_id)
+            self._notify(address, args, None, False, None)
             return
 
-        # Normalise address to /<domain>/<entity_name> for filter matching
-        canonical = f"/{domain}/{entity_name}"
         rules = self._filter_rules
+        blocked = not is_address_allowed(canonical, rules)
 
-        if not is_address_allowed(canonical, rules):
-            _LOGGER.debug("OSC address blocked by filter rules: %s", canonical)
+        service_info: tuple | None = None
+        service_str: str | None = None
+        if not blocked:
+            service_info = resolve_service_call(domain, entity_id, args)
+            if service_info:
+                service_str = f"{service_info[0]}.{service_info[1]}"
+
+        self._notify(address, args, entity_id, blocked, service_str)
+
+        if blocked:
+            _LOGGER.debug("OSC address blocked by filter: %s", canonical)
             return
 
-        service_info = resolve_service_call(domain, entity_id, args)
         if service_info is None:
             return
 
@@ -300,6 +329,29 @@ class OSCServer:
             self._call_service(svc_domain, svc_name, svc_data),
             name=f"ha_osc.{svc_domain}.{svc_name}",
         )
+
+    def _notify(
+        self,
+        address: str,
+        args: list[Any],
+        entity_id: str | None,
+        blocked: bool,
+        service: str | None,
+    ) -> None:
+        """Fire an HA event and push state to the monitor sensor callback."""
+        self._hass.bus.async_fire(
+            "ha_osc_message",
+            {
+                "address": address,
+                "args": args,
+                "entity_id": entity_id,
+                "blocked": blocked,
+                "service": service,
+                "port": self.port,
+            },
+        )
+        if self._monitor_callback is not None:
+            self._monitor_callback(address, args, entity_id, blocked, service)
 
     async def _call_service(
         self, domain: str, service: str, data: dict[str, Any]

@@ -12,9 +12,7 @@ from .osc_server import OSCServer
 
 _LOGGER = logging.getLogger(__name__)
 
-# This integration provides no HA platforms (sensors, switches, etc.).
-# It only runs an OSC server that calls services on existing entities.
-PLATFORMS: list[str] = []
+PLATFORMS: list[str] = ["sensor"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -30,6 +28,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = server
 
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     return True
@@ -37,6 +36,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Stop the OSC server and clean up."""
+    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        return False
     server: OSCServer = hass.data[DOMAIN].pop(entry.entry_id)
     await server.stop()
     return True
