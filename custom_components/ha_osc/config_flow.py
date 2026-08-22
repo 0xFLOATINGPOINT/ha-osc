@@ -6,7 +6,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.core import callback
 
-from .const import CONF_FILTER_RULES, CONF_PORT, DEFAULT_FILTER_RULES, DEFAULT_PORT, DOMAIN
+from .const import CONF_DEBOUNCE_MS, CONF_FILTER_RULES, CONF_PORT, DEFAULT_DEBOUNCE_MS, DEFAULT_FILTER_RULES, DEFAULT_PORT, DOMAIN
 from .osc_server import validate_filter_rules
 
 try:
@@ -23,22 +23,34 @@ except ImportError:
     _HAS_SELECTORS = False
 
 
-def _port_schema(default_port: int, default_rules: str) -> vol.Schema:
+def _port_schema(
+    default_port: int,
+    default_rules: str,
+    default_debounce: int = DEFAULT_DEBOUNCE_MS,
+) -> vol.Schema:
     """Build the voluptuous schema for the setup / options form."""
     if _HAS_SELECTORS:
         port_field = NumberSelector(
             NumberSelectorConfig(min=1, max=65535, step=1, mode=NumberSelectorMode.BOX)
+        )
+        debounce_field = NumberSelector(
+            NumberSelectorConfig(
+                min=0, max=1000, step=10, mode=NumberSelectorMode.SLIDER,
+                unit_of_measurement="ms",
+            )
         )
         rules_field = TextSelector(
             TextSelectorConfig(multiline=True, type=TextSelectorType.TEXT)
         )
     else:
         port_field = vol.All(vol.Coerce(int), vol.Range(min=1, max=65535))
+        debounce_field = vol.All(vol.Coerce(int), vol.Range(min=0, max=1000))
         rules_field = str
 
     return vol.Schema(
         {
             vol.Required(CONF_PORT, default=default_port): port_field,
+            vol.Required(CONF_DEBOUNCE_MS, default=default_debounce): debounce_field,
             vol.Optional(CONF_FILTER_RULES, default=default_rules): rules_field,
         }
     )
@@ -68,7 +80,11 @@ class OscConfigFlow(ConfigFlow, domain=DOMAIN):
 
                 return self.async_create_entry(
                     title=f"OSC port {port}",
-                    data={CONF_PORT: port, CONF_FILTER_RULES: rules_text},
+                    data={
+                        CONF_PORT: port,
+                        CONF_DEBOUNCE_MS: int(user_input.get(CONF_DEBOUNCE_MS, DEFAULT_DEBOUNCE_MS)),
+                        CONF_FILTER_RULES: rules_text,
+                    },
                 )
 
         return self.async_show_form(
@@ -96,6 +112,12 @@ class OscOptionsFlow(OptionsFlow):
                 CONF_PORT, self.config_entry.data.get(CONF_PORT, DEFAULT_PORT)
             )
         )
+        current_debounce = int(
+            self.config_entry.options.get(
+                CONF_DEBOUNCE_MS,
+                self.config_entry.data.get(CONF_DEBOUNCE_MS, DEFAULT_DEBOUNCE_MS),
+            )
+        )
         current_rules: str = self.config_entry.options.get(
             CONF_FILTER_RULES,
             self.config_entry.data.get(CONF_FILTER_RULES, DEFAULT_FILTER_RULES),
@@ -103,6 +125,7 @@ class OscOptionsFlow(OptionsFlow):
 
         if user_input is not None:
             port = int(user_input[CONF_PORT])
+            debounce = int(user_input.get(CONF_DEBOUNCE_MS, DEFAULT_DEBOUNCE_MS))
             rules_text: str = user_input.get(CONF_FILTER_RULES, DEFAULT_FILTER_RULES)
 
             rule_error = validate_filter_rules(rules_text)
@@ -111,11 +134,11 @@ class OscOptionsFlow(OptionsFlow):
             else:
                 return self.async_create_entry(
                     title="",
-                    data={CONF_PORT: port, CONF_FILTER_RULES: rules_text},
+                    data={CONF_PORT: port, CONF_DEBOUNCE_MS: debounce, CONF_FILTER_RULES: rules_text},
                 )
 
         return self.async_show_form(
             step_id="init",
-            data_schema=_port_schema(current_port, current_rules),
+            data_schema=_port_schema(current_port, current_rules, current_debounce),
             errors=errors,
         )

@@ -6,10 +6,12 @@
         "description": "Configure a UDP port for receiving OSC (Open Sound Control) messages. Messages will be routed to Home Assistant entities automatically based on their address.",
         "data": {
           "port": "UDP Port",
+          "debounce_ms": "Throttle (debounce)",
           "filter_rules": "Filter Rules"
         },
         "data_description": {
           "port": "UDP port to listen on (default: 8000). Make sure this port is not blocked by your firewall.",
+          "debounce_ms": "How long to wait (ms) after the last message before acting. Set to 0 to fire every packet immediately. 80–200 ms is recommended for faders and sliders.",
           "filter_rules": "Optional — one rule per line.\n\n• Start a line with  -  to block an address pattern, e.g.  -/light/*\n• Start a line with  +  to explicitly allow a pattern, e.g.  +/light/kitchen\n• Lines beginning with # are comments.\n\nOnce any + rule is added, only matching addresses are allowed (whitelist mode). Without + rules, everything is allowed except blocked patterns."
         }
       }
@@ -29,10 +31,12 @@
         "description": "Changes take effect immediately after saving. The server will restart if the port is changed.",
         "data": {
           "port": "UDP Port",
+          "debounce_ms": "Throttle (debounce)",
           "filter_rules": "Filter Rules"
         },
         "data_description": {
           "port": "UDP port to listen on.",
+          "debounce_ms": "Throttle delay in ms. Rapid messages for the same address are collapsed — only the last value is sent to HA once the stream goes quiet. 0 = no throttling.",
           "filter_rules": "One rule per line.\n\n• -/light/*           → block all lights\n• +/light/kitchen     → allow kitchen light (overrides a block)\n• -/media_player/*    → block all media players\n\nIf any + rule exists, only matching addresses are allowed (whitelist mode).\nLines starting with # are ignored."
         }
       }

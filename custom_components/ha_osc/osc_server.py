@@ -24,7 +24,7 @@ from pythonosc.osc_server import AsyncIOOSCUDPServer
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_FILTER_RULES, CONF_PORT, DEFAULT_FILTER_RULES, DEFAULT_PORT
+from .const import CONF_DEBOUNCE_MS, CONF_FILTER_RULES, CONF_PORT, DEFAULT_DEBOUNCE_MS, DEFAULT_FILTER_RULES, DEFAULT_PORT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -139,13 +139,16 @@ def resolve_service_call(
         if domain == "light":
             if fval <= 0:
                 return "light", "turn_off", {"entity_id": entity_id}
+            # Integer 1 = plain turn_on — let HA restore the last brightness
+            if isinstance(value, int) and value == 1:
+                return "homeassistant", "turn_on", {"entity_id": entity_id}
             if fval <= 1.0:
-                # 0.0–1.0 treated as brightness percentage
+                # Float 0.0–1.0 = normalized brightness percentage
                 return "light", "turn_on", {
                     "entity_id": entity_id,
                     "brightness_pct": min(100, max(1, round(fval * 100))),
                 }
-            # >1 treated as raw brightness (0–255)
+            # int/float > 1 = raw brightness (0–255)
             return "light", "turn_on", {
                 "entity_id": entity_id,
                 "brightness": min(255, max(1, round(fval))),
@@ -223,6 +226,8 @@ class OSCServer:
         self._entry = entry
         self._transport: asyncio.BaseTransport | None = None
         self._monitor_callback: Any | None = None
+        self._pending_handles: dict[str, asyncio.TimerHandle] = {}
+        self._pending_data: dict[str, tuple[str, str, dict]] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -245,6 +250,15 @@ class OSCServer:
         )
         return parse_filter_rules(rules_text)
 
+    @property
+    def _debounce_ms(self) -> int:
+        """Return the debounce interval in ms (0 = disabled)."""
+        raw = self._entry.options.get(
+            CONF_DEBOUNCE_MS,
+            self._entry.data.get(CONF_DEBOUNCE_MS, DEFAULT_DEBOUNCE_MS),
+        )
+        return int(raw)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -260,7 +274,11 @@ class OSCServer:
         _LOGGER.info("OSC server listening on UDP port %d", self.port)
 
     async def stop(self) -> None:
-        """Close the UDP socket."""
+        """Cancel pending debounced calls and close the UDP socket."""
+        for handle in self._pending_handles.values():
+            handle.cancel()
+        self._pending_handles.clear()
+        self._pending_data.clear()
         if self._transport is not None:
             self._transport.close()
             self._transport = None
@@ -273,6 +291,45 @@ class OSCServer:
     def clear_monitor_callback(self) -> None:
         """Remove the monitor callback."""
         self._monitor_callback = None
+
+    def _schedule_debounced(
+        self, canonical: str, svc_domain: str, svc_name: str, svc_data: dict
+    ) -> None:
+        """Cancel any queued call for this address and reschedule with the latest value.
+
+        When rapid messages arrive (e.g. a fader being moved), only the last
+        value is sent to HA once the stream goes quiet for *debounce_ms* ms.
+        Set debounce_ms to 0 to disable and fire every message immediately.
+        """
+        existing = self._pending_handles.pop(canonical, None)
+        if existing is not None:
+            existing.cancel()
+
+        self._pending_data[canonical] = (svc_domain, svc_name, svc_data)
+
+        delay = self._debounce_ms
+        if delay <= 0:
+            self._fire_debounced(canonical)
+            return
+
+        handle = asyncio.get_running_loop().call_later(
+            delay / 1000.0,
+            self._fire_debounced,
+            canonical,
+        )
+        self._pending_handles[canonical] = handle
+
+    def _fire_debounced(self, canonical: str) -> None:
+        """Execute the most-recently queued service call for *canonical*."""
+        self._pending_handles.pop(canonical, None)
+        pending = self._pending_data.pop(canonical, None)
+        if pending is None:
+            return
+        svc_domain, svc_name, svc_data = pending
+        self._hass.async_create_task(
+            self._call_service(svc_domain, svc_name, svc_data),
+            name=f"ha_osc.debounced.{svc_domain}.{svc_name}",
+        )
 
     # ------------------------------------------------------------------
     # Message handling
@@ -325,10 +382,7 @@ class OSCServer:
             return
 
         svc_domain, svc_name, svc_data = service_info
-        self._hass.async_create_task(
-            self._call_service(svc_domain, svc_name, svc_data),
-            name=f"ha_osc.{svc_domain}.{svc_name}",
-        )
+        self._schedule_debounced(canonical, svc_domain, svc_name, svc_data)
 
     def _notify(
         self,
