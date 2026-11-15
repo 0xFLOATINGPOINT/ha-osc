@@ -25,6 +25,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import CONF_DEBOUNCE_MS, CONF_FILTER_RULES, CONF_PORT, DEFAULT_DEBOUNCE_MS, DEFAULT_FILTER_RULES, DEFAULT_PORT
+from .mapping import build_light_call, split_address
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,25 +80,17 @@ def is_address_allowed(osc_address: str, rules: list[tuple[str, str]]) -> bool:
     3. Default behaviour depends on whether *any* ``+`` rule exists:
        - If **no** ``+`` rules → **allow** (blacklist mode).
        - If **any** ``+`` rule → **deny** (whitelist mode).
-
-    This means:
-    - Only ``-`` rules → everything allowed except blocked patterns.
-    - Any ``+`` rule present → nothing allowed except explicitly whitelisted.
-    - Mix of both → ``+`` exceptions punch holes through ``-`` blocks.
     """
     has_allow_rules = any(sign == "+" for sign, _ in rules)
 
-    # + rules have highest priority
     for sign, pattern in rules:
         if sign == "+" and fnmatch.fnmatch(osc_address, pattern):
             return True
 
-    # - rules block
     for sign, pattern in rules:
         if sign == "-" and fnmatch.fnmatch(osc_address, pattern):
             return False
 
-    # Default: deny when whitelist mode is active, allow otherwise
     return not has_allow_rules
 
 
@@ -106,22 +99,33 @@ def is_address_allowed(osc_address: str, rules: list[tuple[str, str]]) -> bool:
 # ---------------------------------------------------------------------------
 
 def resolve_service_call(
-    domain: str, entity_id: str, args: list[Any]
+    domain: str, entity_id: str, args: list[Any], suffix: str | None = None
 ) -> tuple[str, str, dict[str, Any]] | None:
     """Map an OSC *domain*, *entity_id*, and argument list to an HA service call.
 
     Returns ``(service_domain, service_name, service_data)`` or ``None`` if the
     arguments cannot be interpreted.
 
-    Value conventions
-    -----------------
-    - No arguments → toggle
-    - ``bool`` / ``int 0``  → turn_off
-    - ``int 1``             → turn_on
-    - ``float 0.0–1.0``    → percentage / level (domain-aware)
-    - ``float/int > 1``    → absolute value (brightness 0-255, temp, etc.)
-    - ``str``              → "on"/"off"/"toggle" keywords
+    For ``light`` entities, *suffix* selects which property is being set
+    (``rgb``, ``color_temp``, ``kelvin``, ...). Other domains ignore it.
     """
+    # Light entities have their own suffix-aware mapping.
+    if domain == "light":
+        result = build_light_call(suffix, args)
+        if result is None:
+            _LOGGER.debug(
+                "Cannot resolve light call for %s suffix=%r args=%s",
+                entity_id, suffix, args,
+            )
+            return None
+        service_name, data = result
+        data = {"entity_id": entity_id, **data}
+        # homeassistant.turn_on / turn_off / toggle are safer fallbacks than
+        # light.turn_on when the entity's platform lacks the specific service.
+        if service_name in ("turn_on", "turn_off", "toggle"):
+            return "light", service_name, data
+        return "light", service_name, data
+
     if not args:
         return "homeassistant", "toggle", {"entity_id": entity_id}
 
@@ -135,24 +139,6 @@ def resolve_service_call(
     # --- Numeric (int / float) ---------------------------------------------
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         fval = float(value)
-
-        if domain == "light":
-            if fval <= 0:
-                return "light", "turn_off", {"entity_id": entity_id}
-            # Integer 1 = plain turn_on — let HA restore the last brightness
-            if isinstance(value, int) and value == 1:
-                return "homeassistant", "turn_on", {"entity_id": entity_id}
-            if fval <= 1.0:
-                # Float 0.0–1.0 = normalized brightness percentage
-                return "light", "turn_on", {
-                    "entity_id": entity_id,
-                    "brightness_pct": min(100, max(1, round(fval * 100))),
-                }
-            # int/float > 1 = raw brightness (0–255)
-            return "light", "turn_on", {
-                "entity_id": entity_id,
-                "brightness": min(255, max(1, round(fval))),
-            }
 
         if domain == "media_player":
             if fval <= 0:
@@ -193,7 +179,6 @@ def resolve_service_call(
                 "temperature": fval,
             }
 
-        # Generic on/off for everything else
         if fval <= 0:
             return "homeassistant", "turn_off", {"entity_id": entity_id}
         return "homeassistant", "turn_on", {"entity_id": entity_id}
@@ -346,7 +331,11 @@ class OSCServer:
         """Parse address, apply filters, fire events, and schedule service calls."""
         _LOGGER.debug("OSC received: %s %s", address, args)
 
-        parts = [p for p in address.split("/") if p]
+        # Split the optional /rgb, /color_temp, /brightness ... suffix off the
+        # address. The base address (domain + entity_name) is what filters and
+        # debouncing operate on.
+        base_address, suffix = split_address(address)
+        parts = [p for p in base_address.split("/") if p]
         if len(parts) < 2:
             _LOGGER.debug("Malformed OSC address (need /<domain>/<entity_name>): %s", address)
             self._notify(address, args, None, False, None)
@@ -363,12 +352,15 @@ class OSCServer:
             return
 
         rules = self._filter_rules
+        # Filters and debouncing key off the *base* address so a rule like
+        # `+/light/kitchen` covers /light/kitchen/rgb etc. Debouncing is also
+        # per entity so a brightness message doesn't overwrite a pending RGB.
         blocked = not is_address_allowed(canonical, rules)
 
         service_info: tuple | None = None
         service_str: str | None = None
         if not blocked:
-            service_info = resolve_service_call(domain, entity_id, args)
+            service_info = resolve_service_call(domain, entity_id, args, suffix)
             if service_info:
                 service_str = f"{service_info[0]}.{service_info[1]}"
 
@@ -411,7 +403,6 @@ class OSCServer:
         self, domain: str, service: str, data: dict[str, Any]
     ) -> None:
         """Execute the resolved HA service call."""
-        # Fall back to homeassistant domain if the specific domain lacks the service
         if not self._hass.services.has_service(domain, service):
             if service in ("turn_on", "turn_off", "toggle"):
                 domain = "homeassistant"
