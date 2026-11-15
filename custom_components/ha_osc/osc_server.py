@@ -9,8 +9,6 @@ from typing import Any
 
 import warnings as _warnings
 
-# python-osc <= 1.8.3 contains an invalid escape sequence (\w) in dispatcher.py
-# which emits SyntaxWarning on Python 3.12+. Suppress it before import.
 _warnings.filterwarnings(
     "ignore",
     category=SyntaxWarning,
@@ -29,7 +27,6 @@ from .mapping import build_light_call, split_address
 
 _LOGGER = logging.getLogger(__name__)
 
-# Valid HA entity ID: domain.object_id
 _ENTITY_ID_RE = re.compile(r"^[a-z_][a-z0-9_]*\.[a-z0-9_]+$")
 
 
@@ -38,14 +35,6 @@ _ENTITY_ID_RE = re.compile(r"^[a-z_][a-z0-9_]*\.[a-z0-9_]+$")
 # ---------------------------------------------------------------------------
 
 def parse_filter_rules(rules_text: str) -> list[tuple[str, str]]:
-    """Parse filter rules from a multiline string.
-
-    Each non-blank, non-comment line must start with '+' (allow) or '-' (deny),
-    followed by a glob pattern matching an OSC address, e.g. ``-/light/*``.
-    Lines starting with ``#`` are treated as comments.
-
-    Returns a list of ``(sign, pattern)`` tuples in source order.
-    """
     rules: list[tuple[str, str]] = []
     for line in rules_text.splitlines():
         line = line.strip()
@@ -59,7 +48,6 @@ def parse_filter_rules(rules_text: str) -> list[tuple[str, str]]:
 
 
 def validate_filter_rules(rules_text: str) -> str | None:
-    """Return an error key if *rules_text* contains invalid lines, else None."""
     for line in rules_text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -70,17 +58,6 @@ def validate_filter_rules(rules_text: str) -> str | None:
 
 
 def is_address_allowed(osc_address: str, rules: list[tuple[str, str]]) -> bool:
-    """Decide whether *osc_address* passes the current filter rules.
-
-    Priority model
-    --------------
-    1. ``+`` rules are checked first and **always win** — a ``+`` match allows
-       the address regardless of any ``-`` rules.
-    2. ``-`` rules are checked next — a ``-`` match blocks the address.
-    3. Default behaviour depends on whether *any* ``+`` rule exists:
-       - If **no** ``+`` rules → **allow** (blacklist mode).
-       - If **any** ``+`` rule → **deny** (whitelist mode).
-    """
     has_allow_rules = any(sign == "+" for sign, _ in rules)
 
     for sign, pattern in rules:
@@ -99,19 +76,20 @@ def is_address_allowed(osc_address: str, rules: list[tuple[str, str]]) -> bool:
 # ---------------------------------------------------------------------------
 
 def resolve_service_call(
-    domain: str, entity_id: str, args: list[Any], suffix: str | None = None
+    domain: str,
+    entity_id: str,
+    args: list[Any],
+    suffix: str | None = None,
+    supported: list[str] | None = None,
 ) -> tuple[str, str, dict[str, Any]] | None:
     """Map an OSC *domain*, *entity_id*, and argument list to an HA service call.
 
-    Returns ``(service_domain, service_name, service_data)`` or ``None`` if the
-    arguments cannot be interpreted.
-
-    For ``light`` entities, *suffix* selects which property is being set
-    (``rgb``, ``color_temp``, ``kelvin``, ...). Other domains ignore it.
+    For ``light`` entities, *suffix* selects the property, and *supported* is
+    the entity's ``supported_color_modes`` (so we can translate e.g. ``rgb`` →
+    ``hs_color`` for a bulb that doesn't advertise ``rgb``).
     """
-    # Light entities have their own suffix-aware mapping.
     if domain == "light":
-        result = build_light_call(suffix, args)
+        result = build_light_call(suffix, args, supported)
         if result is None:
             _LOGGER.debug(
                 "Cannot resolve light call for %s suffix=%r args=%s",
@@ -120,10 +98,6 @@ def resolve_service_call(
             return None
         service_name, data = result
         data = {"entity_id": entity_id, **data}
-        # homeassistant.turn_on / turn_off / toggle are safer fallbacks than
-        # light.turn_on when the entity's platform lacks the specific service.
-        if service_name in ("turn_on", "turn_off", "toggle"):
-            return "light", service_name, data
         return "light", service_name, data
 
     if not args:
@@ -131,12 +105,10 @@ def resolve_service_call(
 
     value = args[0]
 
-    # --- Boolean -----------------------------------------------------------
     if isinstance(value, bool):
         svc = "turn_on" if value else "turn_off"
         return "homeassistant", svc, {"entity_id": entity_id}
 
-    # --- Numeric (int / float) ---------------------------------------------
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         fval = float(value)
 
@@ -183,7 +155,6 @@ def resolve_service_call(
             return "homeassistant", "turn_off", {"entity_id": entity_id}
         return "homeassistant", "turn_on", {"entity_id": entity_id}
 
-    # --- String keywords ---------------------------------------------------
     if isinstance(value, str):
         kw = value.lower().strip()
         if kw in ("toggle", "t"):
@@ -214,13 +185,8 @@ class OSCServer:
         self._pending_handles: dict[str, asyncio.TimerHandle] = {}
         self._pending_data: dict[str, tuple[str, str, dict]] = {}
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
     @property
     def port(self) -> int:
-        """Return the effective port (options override data)."""
         raw = self._entry.options.get(
             CONF_PORT, self._entry.data.get(CONF_PORT, DEFAULT_PORT)
         )
@@ -228,7 +194,6 @@ class OSCServer:
 
     @property
     def _filter_rules(self) -> list[tuple[str, str]]:
-        """Return parsed filter rules, re-read from entry on every access."""
         rules_text: str = self._entry.options.get(
             CONF_FILTER_RULES,
             self._entry.data.get(CONF_FILTER_RULES, DEFAULT_FILTER_RULES),
@@ -237,19 +202,13 @@ class OSCServer:
 
     @property
     def _debounce_ms(self) -> int:
-        """Return the debounce interval in ms (0 = disabled)."""
         raw = self._entry.options.get(
             CONF_DEBOUNCE_MS,
             self._entry.data.get(CONF_DEBOUNCE_MS, DEFAULT_DEBOUNCE_MS),
         )
         return int(raw)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     async def start(self) -> None:
-        """Bind the UDP socket and begin listening."""
         dispatcher = Dispatcher()
         dispatcher.set_default_handler(self._handle_message, needs_reply_address=False)
 
@@ -259,7 +218,6 @@ class OSCServer:
         _LOGGER.info("OSC server listening on UDP port %d", self.port)
 
     async def stop(self) -> None:
-        """Cancel pending debounced calls and close the UDP socket."""
         for handle in self._pending_handles.values():
             handle.cancel()
         self._pending_handles.clear()
@@ -270,27 +228,27 @@ class OSCServer:
             _LOGGER.info("OSC server stopped")
 
     def set_monitor_callback(self, callback: Any) -> None:
-        """Register a callback invoked for every incoming message (used by the sensor)."""
         self._monitor_callback = callback
 
     def clear_monitor_callback(self) -> None:
-        """Remove the monitor callback."""
         self._monitor_callback = None
 
     def _schedule_debounced(
         self, canonical: str, svc_domain: str, svc_name: str, svc_data: dict
     ) -> None:
-        """Cancel any queued call for this address and reschedule with the latest value.
-
-        When rapid messages arrive (e.g. a fader being moved), only the last
-        value is sent to HA once the stream goes quiet for *debounce_ms* ms.
-        Set debounce_ms to 0 to disable and fire every message immediately.
-        """
+        """Queue (or merge into) the pending call for *canonical*."""
         existing = self._pending_handles.pop(canonical, None)
         if existing is not None:
             existing.cancel()
 
-        self._pending_data[canonical] = (svc_domain, svc_name, svc_data)
+        # Merge into any pending payload so successive faders combine:
+        #   /light/x/brightness 0.5  +  /light/x/rgb [1,0,0.5]  →  one call
+        prev = self._pending_data.get(canonical)
+        if prev is not None and prev[0] == svc_domain and prev[1] == svc_name:
+            merged = {**prev[2], **svc_data}
+            self._pending_data[canonical] = (svc_domain, svc_name, merged)
+        else:
+            self._pending_data[canonical] = (svc_domain, svc_name, svc_data)
 
         delay = self._debounce_ms
         if delay <= 0:
@@ -305,7 +263,6 @@ class OSCServer:
         self._pending_handles[canonical] = handle
 
     def _fire_debounced(self, canonical: str) -> None:
-        """Execute the most-recently queued service call for *canonical*."""
         self._pending_handles.pop(canonical, None)
         pending = self._pending_data.pop(canonical, None)
         if pending is None:
@@ -316,24 +273,15 @@ class OSCServer:
             name=f"ha_osc.debounced.{svc_domain}.{svc_name}",
         )
 
-    # ------------------------------------------------------------------
-    # Message handling
-    # ------------------------------------------------------------------
-
     def _handle_message(self, address: str, *args: Any) -> None:
-        """Called by python-osc for every incoming UDP datagram."""
         try:
             self._dispatch(address, list(args))
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Unexpected error handling OSC message %s %s", address, args)
 
     def _dispatch(self, address: str, args: list[Any]) -> None:
-        """Parse address, apply filters, fire events, and schedule service calls."""
         _LOGGER.debug("OSC received: %s %s", address, args)
 
-        # Split the optional /rgb, /color_temp, /brightness ... suffix off the
-        # address. The base address (domain + entity_name) is what filters and
-        # debouncing operate on.
         base_address, suffix = split_address(address)
         parts = [p for p in base_address.split("/") if p]
         if len(parts) < 2:
@@ -352,15 +300,23 @@ class OSCServer:
             return
 
         rules = self._filter_rules
-        # Filters and debouncing key off the *base* address so a rule like
-        # `+/light/kitchen` covers /light/kitchen/rgb etc. Debouncing is also
-        # per entity so a brightness message doesn't overwrite a pending RGB.
         blocked = not is_address_allowed(canonical, rules)
 
         service_info: tuple | None = None
         service_str: str | None = None
         if not blocked:
-            service_info = resolve_service_call(domain, entity_id, args, suffix)
+            # Look up supported_color_modes so light calls can pick the right
+            # attribute (rgb_color / hs_color / xy_color / rgbw_color).
+            supported: list[str] = []
+            if domain == "light":
+                state = self._hass.states.get(entity_id)
+                if state is not None:
+                    supported = list(
+                        state.attributes.get("supported_color_modes") or []
+                    )
+            service_info = resolve_service_call(
+                domain, entity_id, args, suffix, supported
+            )
             if service_info:
                 service_str = f"{service_info[0]}.{service_info[1]}"
 
@@ -384,7 +340,6 @@ class OSCServer:
         blocked: bool,
         service: str | None,
     ) -> None:
-        """Fire an HA event and push state to the monitor sensor callback."""
         self._hass.bus.async_fire(
             "ha_osc_message",
             {
@@ -402,7 +357,6 @@ class OSCServer:
     async def _call_service(
         self, domain: str, service: str, data: dict[str, Any]
     ) -> None:
-        """Execute the resolved HA service call."""
         if not self._hass.services.has_service(domain, service):
             if service in ("turn_on", "turn_off", "toggle"):
                 domain = "homeassistant"

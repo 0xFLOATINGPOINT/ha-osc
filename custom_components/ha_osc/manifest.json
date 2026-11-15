@@ -1,7 +1,7 @@
 {
   "domain": "ha_osc",
   "name": "OSC (Open Sound Control)",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "documentation": "https://github.com/jeremy-lx-design/ha-osc",
   "issue_tracker": "https://github.com/jeremy-lx-design/ha-osc/issues",
   "requirements": ["python-osc==1.8.3"],
